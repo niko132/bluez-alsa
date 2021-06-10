@@ -70,8 +70,6 @@ struct io_thread_data {
 	struct { int v[16]; size_t i; } coutq;
 	/* local counter for RTP sequence number */
 	uint16_t rtp_seq_number;
-	/* determine whether transport is locked */
-	bool t_locked;
 };
 
 /**
@@ -87,10 +85,10 @@ static ssize_t a2dp_poll_and_read_pcm(struct io_thread_data *io,
 		{ th->pipe[0], POLLIN, 0 },
 		{ -1, POLLIN, 0 }};
 
+repoll:
+
 	/* Allow escaping from the poll() by thread cancellation. */
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-
-repoll:
 
 	/* Add PCM socket to the poll if it is active. */
 	fds[1].fd = pcm->active ? pcm->fd : -1;
@@ -100,11 +98,12 @@ repoll:
 	case 0:
 		pthread_cond_signal(&pcm->synced);
 		io->timeout = -1;
-		io->t_locked = !ba_transport_thread_cleanup_lock(th);
-		if (pcm->fd == -1)
+		pthread_mutex_lock(&pcm->mutex);
+		if (pcm->fd == -1) {
+			pthread_mutex_unlock(&pcm->mutex);
 			return 0;
-		ba_transport_thread_cleanup_unlock(th);
-		io->t_locked = false;
+		}
+		pthread_mutex_unlock(&pcm->mutex);
 		goto repoll;
 	case -1:
 		if (errno == EINTR)
@@ -134,6 +133,8 @@ repoll:
 		}
 	}
 
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
 	ssize_t samples;
 	switch (samples = io_pcm_read(pcm, buffer->tail, ffb_len_in(buffer))) {
 	case 0:
@@ -145,8 +146,6 @@ repoll:
 			goto repoll;
 		return -1;
 	}
-
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
 	/* When the thread is created, there might be no data in the FIFO. In fact
 	 * there might be no data for a long time - until client starts playback.
@@ -382,16 +381,12 @@ static void *a2dp_sink_sbc(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	/* Lock transport during thread cancellation. This handler shall be at
-	 * the top of the cleanup stack - lastly pushed. */
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 #if DEBUG
 	uint16_t sbc_bitpool = 0;
 #endif
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t len;
 		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
@@ -444,8 +439,8 @@ static void *a2dp_sink_sbc(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -508,8 +503,6 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	rtp_header_t *rtp_header;
 	rtp_media_header_t *rtp_media_header;
 
@@ -520,7 +513,7 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 	uint32_t timestamp = be32toh(rtp_header->timestamp);
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
@@ -591,8 +584,8 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -683,10 +676,8 @@ static void *a2dp_sink_mpeg(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t len;
 		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
@@ -773,8 +764,8 @@ decode:
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -897,8 +888,6 @@ static void *a2dp_source_mp3(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	rtp_header_t *rtp_header;
 	rtp_mpeg_audio_header_t *rtp_mpeg_audio_header;
 
@@ -909,7 +898,7 @@ static void *a2dp_source_mp3(struct ba_transport_thread *th) {
 	uint32_t timestamp = be32toh(rtp_header->timestamp);
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
@@ -991,8 +980,8 @@ static void *a2dp_source_mp3(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1060,12 +1049,10 @@ static void *a2dp_sink_aac(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	int markbit_quirk = -3;
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t len;
 		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
@@ -1135,8 +1122,8 @@ static void *a2dp_sink_aac(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1261,8 +1248,6 @@ static void *a2dp_source_aac(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	rtp_header_t *rtp_header;
 
 	/* initialize RTP header and get anchor for payload */
@@ -1295,7 +1280,7 @@ static void *a2dp_source_aac(struct ba_transport_thread *th) {
 	AACENC_OutArgs out_args = { 0 };
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
@@ -1373,8 +1358,8 @@ static void *a2dp_source_aac(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1420,10 +1405,8 @@ static void *a2dp_sink_aptx(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t len;
 		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
@@ -1464,8 +1447,8 @@ static void *a2dp_sink_aptx(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1511,10 +1494,8 @@ static void *a2dp_source_aptx(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
@@ -1579,8 +1560,8 @@ static void *a2dp_source_aptx(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1626,10 +1607,8 @@ static void *a2dp_sink_aptx_hd(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t len;
 		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
@@ -1673,8 +1652,8 @@ static void *a2dp_sink_aptx_hd(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1721,8 +1700,6 @@ static void *a2dp_source_aptx_hd(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	rtp_header_t *rtp_header;
 
 	/* initialize RTP header and get anchor for payload */
@@ -1731,7 +1708,7 @@ static void *a2dp_source_aptx_hd(struct ba_transport_thread *th) {
 	uint32_t timestamp = be32toh(rtp_header->timestamp);
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
@@ -1804,8 +1781,8 @@ static void *a2dp_source_aptx_hd(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1860,10 +1837,8 @@ static void *a2dp_sink_ldac(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t len;
 		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
@@ -1908,8 +1883,8 @@ static void *a2dp_sink_ldac(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -1981,8 +1956,6 @@ static void *a2dp_source_ldac(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
-
 	rtp_header_t *rtp_header;
 	rtp_media_header_t *rtp_media_header;
 
@@ -1994,7 +1967,7 @@ static void *a2dp_source_ldac(struct ba_transport_thread *th) {
 	size_t ts_frames = 0;
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
@@ -2063,8 +2036,8 @@ static void *a2dp_source_ldac(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -2116,7 +2089,7 @@ static void *a2dp_sink_dump(struct ba_transport_thread *th) {
 	}
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 		ssize_t len;
 		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
@@ -2129,6 +2102,7 @@ static void *a2dp_sink_dump(struct ba_transport_thread *th) {
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 fail_ffb:
 	pthread_cleanup_pop(1);

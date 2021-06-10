@@ -124,8 +124,10 @@ static void *sco_dispatcher_thread(struct ba_adapter *a) {
 		}
 #endif
 
+		ba_transport_pcms_lock(t);
 		/* make sure, we are not leaking file descriptor */
-		t->release(t);
+		ba_transport_release(t);
+		ba_transport_pcms_unlock(t);
 
 		t->bt_fd = fd;
 		t->mtu_read = t->mtu_write = hci_sco_get_mtu(fd);
@@ -243,7 +245,7 @@ void *sco_thread(struct ba_transport_thread *th) {
 	};
 
 	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_ready(th);;) {
+	for (ba_transport_thread_set_state_running(th);;) {
 
 		/* prevent an unexpected change of the codec value */
 		const uint16_t codec = t->type.codec;
@@ -330,7 +332,7 @@ void *sco_thread(struct ba_transport_thread *th) {
 				if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_AG &&
 						t->sco.spk_pcm.fd == -1 && t->sco.mic_pcm.fd == -1) {
 					debug("Releasing SCO due to PCM inactivity");
-					t->release(t);
+					goto release;
 				}
 				continue;
 			case BA_TRANSPORT_SIGNAL_PCM_SYNC:
@@ -385,8 +387,7 @@ retry_sco_read:
 				case 0:
 				case ECONNABORTED:
 				case ECONNRESET:
-					t->release(t);
-					continue;
+					goto release;
 				default:
 					error("SCO read error: %s", strerror(errno));
 					continue;
@@ -412,7 +413,7 @@ retry_sco_read:
 		}
 		else if (pfds[1].revents & (POLLERR | POLLHUP)) {
 			debug("SCO poll error status: %#x", pfds[1].revents);
-			t->release(t);
+			goto release;
 		}
 
 		if (pfds[2].revents & POLLOUT) {
@@ -445,8 +446,7 @@ retry_sco_write:
 				case 0:
 				case ECONNABORTED:
 				case ECONNRESET:
-					t->release(t);
-					continue;
+					goto release;
 				default:
 					error("SCO write error: %s", strerror(errno));
 					continue;
@@ -509,8 +509,10 @@ retry_sco_write:
 		}
 		else if (pfds[3].revents & (POLLERR | POLLHUP)) {
 			debug("PCM poll error status: %#x", pfds[3].revents);
+			pthread_mutex_lock(&t->sco.spk_pcm.mutex);
 			ba_transport_pcm_release(&t->sco.spk_pcm);
 			ba_transport_thread_send_signal(th, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
+			pthread_mutex_unlock(&t->sco.spk_pcm.mutex);
 		}
 
 		if (pfds[4].revents & POLLOUT) {
@@ -574,10 +576,17 @@ retry_sco_write:
 		const unsigned int delay = asrsync_get_busy_usec(&asrs) / 100;
 		t->sco.spk_pcm.delay = t->sco.mic_pcm.delay = delay;
 
+		continue;
+
+release:
+		ba_transport_pcms_lock(t);
+		ba_transport_release(t);
+		ba_transport_pcms_unlock(t);
 	}
 
 fail:
 	debug_transport_thread_loop(th, "EXIT");
+	ba_transport_thread_set_state_stopping(th);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 fail_ffb:
 #if ENABLE_MSBC
