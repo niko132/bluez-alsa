@@ -428,7 +428,13 @@ static void *pcm_worker_routine(struct pcm_worker *w) {
 				continue;
 			}
 
-			if (alsa_pcm_open(&w->pcm, pcm_device, pcm_format, w->ba_pcm.channels,
+			const char* custom_pcm_device = pcm_device;
+			if (strcmp(w->addr, "C8:E2:65:9B:45:46") == 0) {
+				custom_pcm_device = "upmix2to51pc";
+			}
+			printf("Using device %s\n", custom_pcm_device);
+
+			if (alsa_pcm_open(&w->pcm, custom_pcm_device, pcm_format, w->ba_pcm.channels,
 						w->ba_pcm.sampling, &buffer_time, &period_time, &tmp) != 0) {
 				warn("Couldn't open PCM: %s", tmp);
 				pcm_max_read_len = pcm_max_read_len_init;
@@ -441,7 +447,7 @@ static void *pcm_worker_routine(struct pcm_worker *w) {
 			pcm_max_read_len = period_size * w->ba_pcm.channels * pcm_format_size;
 			pcm_open_retries = 0;
 
-			ring_buff_resize(&buffer, snd_pcm_frames_to_bytes(w->pcm, period_size));
+			ring_buff_resize(&buffer, (size_t)(snd_pcm_frames_to_bytes(w->pcm, period_size) * 1.5));
 
 			if (verbose >= 2) {
 				printf("Used configuration for %s:\n"
@@ -457,7 +463,6 @@ static void *pcm_worker_routine(struct pcm_worker *w) {
 						w->ba_pcm.sampling,
 						w->ba_pcm.channels);
 			}
-
 		}
 
 		/* mark device as active and set timeout to 500ms */
